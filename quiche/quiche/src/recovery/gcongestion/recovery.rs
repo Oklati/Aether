@@ -1033,11 +1033,6 @@ impl RecoveryOps for GRecovery {
     }
 
     fn cwnd_available(&self) -> usize {
-        // Ignore cwnd when sending probe packets.
-        if self.epochs.iter().any(|e| e.loss_probes > 0) {
-            return usize::MAX;
-        }
-
         self.cwnd().saturating_sub(self.bytes_in_flight.get())
     }
 
@@ -1069,6 +1064,10 @@ impl RecoveryOps for GRecovery {
 
     fn max_bandwidth(&self) -> Option<Bandwidth> {
         Some(self.pacer.max_bandwidth())
+    }
+
+    fn rtt_persistent_jump_count(&self) -> u64 {
+        self.pacer.rtt_persistent_jump_count()
     }
 
     /// Statistics from when a CCA first exited the startup phase.
@@ -1155,7 +1154,7 @@ impl RecoveryOps for GRecovery {
         self.epochs[epoch].test_largest_sent_pkt_num_on_path
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qlog"))]
     fn app_limited(&self) -> bool {
         self.pacer.is_app_limited(self.bytes_in_flight.get())
     }
@@ -1209,6 +1208,7 @@ impl RecoveryOps for GRecovery {
             lost_packets: Some(self.lost_count as u64),
             lost_bytes: Some(self.bytes_lost),
             pto_count: Some(self.pto_count),
+            app_limited: Some(self.app_limited()),
         };
 
         self.qlog_metrics.maybe_update(qlog_metrics)
@@ -1343,8 +1343,8 @@ mod tests {
         for subsequent_loss_count in 1..100 {
             // Double the overhead until it caps at `2.0`.
             //
-            // It takes `3` rounds of doubling for INITIAL_TIME_THRESHOLD_OVERHEAD
-            // to equal `1.0`.
+            // The initial time-threshold overhead reaches `1.0` after three
+            // rounds of doubling.
             let new_time_threshold = if subsequent_loss_count <= 3 {
                 1.0 + INITIAL_TIME_THRESHOLD_OVERHEAD *
                     2_f64.powi(subsequent_loss_count as i32)

@@ -38,6 +38,7 @@ use crate::metrics::labels;
 use crate::metrics::quic_expensive_metrics_ip_reduce;
 use crate::metrics::Metrics;
 use crate::quic::connection::SharedConnectionIdGenerator;
+use crate::quic::DscpHandle;
 use crate::settings::Config;
 use datagram_socket::DatagramSocketRecv;
 use datagram_socket::DatagramSocketSend;
@@ -313,14 +314,15 @@ where
             cid_generator,
             handshake_start_time,
             initial_pkt,
+            enable_per_connection_dscp,
         } = new_connection;
 
         let Some(ref shutdown_tx) = self.shutdown_tx else {
-            // don't create new connections if we're shutting down.
+            // Do not create new connections while shutting down.
             return Ok(());
         };
         let Ok(send_permit) = self.accept_sink.try_reserve() else {
-            // drop the connection if the backlog is full. the client will retry.
+            // Drop the connection when the backlog is full. The client retries.
             return Err(
                 labels::QuicInvalidInitialPacketError::AcceptQueueOverflow.into(),
             );
@@ -338,6 +340,7 @@ where
             } else {
                 self.config.has_ipv6pktinfo
             },
+            pool_send_buffer: self.config.pool_send_buffer,
         };
 
         let handshake_info = HandshakeInfo::new(
@@ -348,11 +351,13 @@ where
         let conn = InitialQuicConnection::new(QuicConnectionParams {
             writer_cfg,
             initial_pkt,
+            dscp_handle: enable_per_connection_dscp.then(DscpHandle::new),
             shutdown_tx: shutdown_tx.clone(),
             conn_map_cmd_tx: self.conn_map_cmd_tx.clone(),
             scid: scid.clone(),
             cid_generator,
             metrics: self.metrics.clone(),
+            connection_hook: self.config.connection_hook.clone(),
             #[cfg(feature = "perf-quic-listener-metrics")]
             init_rx_time,
             handshake_info,
@@ -471,9 +476,7 @@ where
                     Ok(r) => {
                         let filled_buf =
                             r.iovs().next().map(Vec::from).unwrap_or_default();
-                        // The slices returend by `nix::socket::recvmsg`'s result
-                        // add up to `r.bytes`. This assert is just to make sure
-                        // the code handles the result correctly.
+                        // Verify that the `recvmsg` slices total `r.bytes`.
                         debug_assert_eq!(r.bytes, filled_buf.len());
 
                         let address = match r.address {
@@ -554,10 +557,8 @@ where
                                     );
                                 },
                                 ControlMessageOwned::Ipv6OrigDstAddr(val) => {
-                                    // Don't have to flip IPv6 bytes since it's a
-                                    // byte array, not a
-                                    // series of bytes parsed as a u32 as in the
-                                    // IPv4 case
+                                    // IPv6 is a byte array and needs no swap.
+                                    // IPv4 is parsed as a `u32` and does.
                                     let source_addr = std::net::Ipv6Addr::from(
                                         val.sin6_addr.s6_addr,
                                     );
@@ -599,8 +600,9 @@ where
                                         let Ok(arr) =
                                             <[u8; 4]>::try_from(data_bytes)
                                         else {
-                                            // Should be unreachable as SO_MARK is
-                                            // a u32: https://elixir.bootlin.com/linux/v6.17/source/include/net/sock.h#L487
+                                            // SO_MARK is a `u32`. This should
+                                            // always succeed.
+                                            // https://elixir.bootlin.com/linux/v6.17/source/include/net/sock.h#L487
                                             continue;
                                         };
 
@@ -807,14 +809,13 @@ where
                 });
             }
 
-            // Fourth, update ConnectionMap before receiving packets. This ensures
-            // our SCID destinations are up-to-date (as of this moment).
-            // If this returns pending, we have processed all available commands
-            // and are registered for a wakeup on the next command.
+            // Fourth, update ConnectionMap before receiving packets so SCID
+            // destinations are current. A pending result means all available
+            // commands were processed and the next command will wake us.
             let _ = self.poll_conn_map_commands(cx);
 
-            // Finally, process up to `PACKET_RX_YIELD_AFTER` packet (batches) at
-            // once. If no more packets are available, we wait to be woken again.
+            // Finally, process up to `PACKET_RX_YIELD_AFTER` packet batches. If
+            // no more packets are available, wait to be woken again.
             for _ in 0..PACKET_RX_YIELD_AFTER {
                 ready!(self.poll_process_packet(cx));
             }
@@ -865,6 +866,7 @@ pub struct NewConnection {
     conn: Box<QuicheConnection>,
     pending_cid: Option<ConnectionId<'static>>,
     initial_pkt: Option<Incoming>,
+    enable_per_connection_dscp: bool,
     cid_generator: Option<SharedConnectionIdGenerator>,
     /// When the handshake started. Should be called before [`quiche::accept`]
     /// or [`quiche::connect`].
@@ -882,6 +884,7 @@ mod tests {
     use crate::http3::settings::Http3Settings;
     use crate::metrics::DefaultMetrics;
     use crate::quic::connection::SimpleConnectionIdGenerator;
+    use crate::quic::Dscp;
     use crate::settings::Config;
     use crate::settings::Hooks;
     use crate::settings::QuicSettings;
@@ -894,6 +897,7 @@ mod tests {
     use datagram_socket::MAX_DATAGRAM_SIZE;
     use futures::FutureExt as _;
     use h3i::actions::h3::Action;
+    use h3i::actions::h3::WaitType;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -911,7 +915,7 @@ mod tests {
         "../quiche/examples/cert.key"
     );
 
-    fn test_connect(host_port: String) {
+    fn test_connect(host_port: String, wait_before_close: Option<Duration>) {
         let h3i_config = h3i::config::Config::new()
             .with_host_port("test.com".to_string())
             .with_idle_timeout(2000)
@@ -925,7 +929,13 @@ mod tests {
             error_code: h3i::quiche::WireErrorCode::NoError as _,
             reason: Vec::new(),
         };
-        let actions = vec![Action::ConnectionClose { error: conn_close }];
+        let mut actions = Vec::new();
+        if let Some(duration) = wait_before_close {
+            actions.push(Action::Wait {
+                wait_type: WaitType::WaitDuration(duration),
+            });
+        }
+        actions.push(Action::ConnectionClose { error: conn_close });
 
         let _ = h3i::client::sync_client::connect(h3i_config, actions, None);
     }
@@ -947,11 +957,12 @@ mod tests {
             kind: crate::settings::CertificateKind::X509,
         };
 
-        let params = ConnectionParams::new_server(
+        let mut params = ConnectionParams::new_server(
             quic_settings,
             tls_cert_settings,
             Hooks::default(),
         );
+        params.enable_per_connection_dscp = true;
         let config = Config::new(&params, SocketCapabilities::default()).unwrap();
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -963,6 +974,7 @@ mod tests {
         let acceptor = ConnectionAcceptor::new(
             ConnectionAcceptorConfig {
                 disable_client_ip_validation: config.disable_client_ip_validation,
+                enable_per_connection_dscp: params.enable_per_connection_dscp,
                 qlog_dir: config.qlog_dir.clone(),
                 qlog_compression: config.qlog_compression,
                 keylog_file: config
@@ -989,23 +1001,139 @@ mod tests {
         tokio::spawn(socket_driver);
 
         // Start a request and drop it after connection establishment
-        std::thread::spawn(move || test_connect(host_port));
+        std::thread::spawn(move || test_connect(host_port, None));
 
         // Wait for a new connection
         time::pause();
 
         let (h3_driver, _) = ServerH3Driver::new(Http3Settings::default());
         let conn = incoming.recv().await.unwrap().unwrap();
+        let dscp_handle = conn.dscp_handle().unwrap().clone();
+        assert_eq!(dscp_handle.get(), None);
+        dscp_handle.set(Dscp::new(0));
+        assert_eq!(conn.dscp_handle().unwrap().get(), Dscp::new(0));
         let drop_check = conn.incoming_ev_sender.clone();
         let _conn = conn.start(h3_driver);
 
-        // Poll the incoming until the connection is dropped
+        // Poll incoming events until the connection is dropped.
         time::advance(Duration::new(30, 0)).await;
         time::resume();
 
-        // NOTE: this is a smoke test - in case of issues `notified()` future will
-        // never resolve hanging the test.
+        // This is a smoke test. A failure leaves `notified()` unresolved and
+        // hangs the test.
         drop_check.closed().await;
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fuzzing")))]
+    #[tokio::test]
+    async fn test_worker_dscp_across_handshake_ipv4() {
+        check_worker_dscp_across_handshake("127.0.0.1:0").await;
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fuzzing")))]
+    #[tokio::test]
+    async fn test_worker_dscp_across_handshake_ipv6() {
+        check_worker_dscp_across_handshake("[::1]:0").await;
+    }
+
+    #[cfg(all(target_os = "linux", not(feature = "fuzzing")))]
+    async fn check_worker_dscp_across_handshake(bind_addr: &str) {
+        use crate::quic::io::gso::test::enable_tos;
+        use crate::quic::io::gso::test::recv_tos;
+        use futures::StreamExt;
+        use nix::sys::socket::setsockopt;
+        use nix::sys::socket::sockopt;
+
+        let socket = std::net::UdpSocket::bind(bind_addr).unwrap();
+        let server_addr = socket.local_addr().unwrap();
+        if server_addr.is_ipv4() {
+            setsockopt(&socket, sockopt::Ipv4Tos, &0).unwrap();
+        } else {
+            setsockopt(&socket, sockopt::Ipv6TClass, &0).unwrap();
+        }
+
+        let mut settings = QuicSettings::default();
+        settings.disable_client_ip_validation = true;
+        let tls_cert = TlsCertificatePaths {
+            cert: TEST_CERT_FILE,
+            private_key: TEST_KEY_FILE,
+            kind: crate::settings::CertificateKind::X509,
+        };
+        let mut params =
+            ConnectionParams::new_server(settings, tls_cert, Hooks::default());
+        params.enable_per_connection_dscp = true;
+        let mut incoming = crate::listen(vec![socket], params, DefaultMetrics)
+            .unwrap()
+            .remove(0);
+
+        let frontend = UdpSocket::bind(bind_addr).await.unwrap();
+        let backend = UdpSocket::bind(bind_addr).await.unwrap();
+        enable_tos(&backend);
+        let host_port = frontend.local_addr().unwrap().to_string();
+        let (marks_tx, mut marks_rx) = tokio::sync::mpsc::unbounded_channel();
+        let relay = tokio::spawn(async move {
+            let mut client_addr = None;
+            let mut buf = [0u8; 2048];
+            loop {
+                tokio::select! {
+                    received = frontend.recv_from(&mut buf) => {
+                        let (len, addr) = received.unwrap();
+                        client_addr = Some(addr);
+                        backend.send_to(&buf[..len], server_addr).await.unwrap();
+                    }
+                    (packet, tos) = recv_tos(&backend) => {
+                        marks_tx.send(tos >> 2).unwrap();
+                        frontend.send_to(&packet, client_addr.unwrap()).await.unwrap();
+                    }
+                }
+            }
+        });
+        let client = tokio::task::spawn_blocking(move || {
+            test_connect(host_port, Some(Duration::from_secs(1)))
+        });
+
+        let conn = time::timeout(Duration::from_secs(5), incoming.next())
+            .await
+            .expect("no initial packet")
+            .expect("listener closed")
+            .expect("initial packet rejected");
+        let dscp = conn.dscp_handle().unwrap().clone();
+        dscp.set(Dscp::new(34));
+        let (driver, controller) = ServerH3Driver::new(Http3Settings::default());
+        let (_, mut worker) =
+            time::timeout(Duration::from_secs(5), conn.handshake(driver))
+                .await
+                .expect("handshake timed out")
+                .expect("handshake failed");
+
+        // No stateless packets are sent when client IP validation is disabled.
+        assert_eq!(
+            time::timeout(Duration::from_secs(5), marks_rx.recv())
+                .await
+                .expect("no handshake packet"),
+            Some(34)
+        );
+
+        // Force a packet in the running worker to verify the handle survives
+        // handshake() and resume(), not just the initial atomic clone.
+        dscp.set(Dscp::new(28));
+        worker.qconn.send_ack_eliciting().unwrap();
+        InitialQuicConnection::resume(worker);
+        time::timeout(Duration::from_secs(5), async {
+            loop {
+                match marks_rx.recv().await.expect("UDP relay closed") {
+                    34 => (), // Handshake packets already in flight.
+                    28 => break,
+                    mark => panic!("unexpected post-handshake DSCP {mark}"),
+                }
+            }
+        })
+        .await
+        .expect("no post-handshake packet with DSCP 28");
+
+        client.await.unwrap();
+        drop(controller);
+        relay.abort();
     }
 
     struct NoopDatagramSender;

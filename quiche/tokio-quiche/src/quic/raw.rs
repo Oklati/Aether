@@ -113,16 +113,20 @@ where
         with_gso: false,
         pacing_offload: false,
         with_pktinfo: false,
+        // Match the default `QuicSettings::pool_send_buffer` (pooling on).
+        pool_send_buffer: true,
     };
 
     let conn_params = QuicConnectionParams {
         writer_cfg,
         initial_pkt: None,
+        dscp_handle: None,
         shutdown_tx,
         conn_map_cmd_tx,
         scid,
         cid_generator: None,
         metrics,
+        connection_hook: None,
         #[cfg(feature = "perf-quic-listener-metrics")]
         init_rx_time: None,
         handshake_info: HandshakeInfo::new(Instant::now(), None),

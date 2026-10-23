@@ -1,6 +1,6 @@
 [package]
 name = "tokio-quiche"
-version = "0.19.0"
+version = "0.20.1"
 description = "Asynchronous wrapper around quiche"
 repository = { workspace = true }
 edition = { workspace = true }
@@ -9,11 +9,13 @@ keywords = ["quic", "http3", "tokio"]
 categories = { workspace = true }
 readme = "README.md"
 rust-version = "1.88"
+build = "build.rs"
 
 [features]
 default = ["qlog-gzip", "qlog-zstd"]
 
 # Forwarded quiche features for re-exports
+congestion_window_unchecked_available = ["quiche/congestion_window_unchecked_available"]
 fuzzing = ["quiche/fuzzing"]
 quiche_internal = ["quiche/internal"]
 
@@ -63,12 +65,19 @@ qlog-gzip = ["qlog/gzip"]
 # connection at runtime via `QuicSettings::qlog_compression`.
 qlog-zstd = ["qlog/zstd"]
 
+[package.metadata.cargo-machete]
+# boring-sys is a dependency solely for its `DEP_BORINGSSL_VERSION_MAJOR`
+# env var, which build.rs reads to detect boring 5.x. It is never
+# imported in source code.
+ignored = ["boring-sys"]
+
 [lints]
 workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
 boring = { workspace = true }
+boring-sys = { workspace = true }
 bytes = { workspace = true }
 crossbeam = { workspace = true, default-features = false }
 datagram-socket = { workspace = true }
@@ -103,13 +112,14 @@ url = { workspace = true }
 
 [dev-dependencies]
 assert_matches = { workspace = true }
-clap = { version = "4.5.40", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }
 h3i = { workspace = true }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
 regex = { workspace = true }
+rstest = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["time", "test-util", "rt-multi-thread"] }

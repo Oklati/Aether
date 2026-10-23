@@ -46,6 +46,8 @@ use self::congestion::recovery::LegacyRecovery;
 use self::gcongestion::GRecovery;
 pub use gcongestion::BbrBwLoReductionStrategy;
 pub use gcongestion::BbrParams;
+#[cfg(feature = "internal")]
+pub use gcongestion::BbrRttJumpDetector;
 
 // Loss Recovery
 const INITIAL_PACKET_THRESHOLD: u64 = 3;
@@ -137,6 +139,8 @@ pub struct RecoveryConfig {
     pub pacing: bool,
     pub max_pacing_rate: Option<u64>,
     pub initial_congestion_window_packets: usize,
+    /// Fixed congestion window in bytes for the unchecked controller.
+    pub unchecked_congestion_window: usize,
     pub enable_relaxed_loss_threshold: bool,
     pub enable_cubic_idle_restart_fix: bool,
 }
@@ -154,6 +158,7 @@ impl RecoveryConfig {
             max_pacing_rate: config.max_pacing_rate,
             initial_congestion_window_packets: config
                 .initial_congestion_window_packets,
+            unchecked_congestion_window: config.unchecked_congestion_window,
             enable_relaxed_loss_threshold: config.enable_relaxed_loss_threshold,
             enable_cubic_idle_restart_fix: config.enable_cubic_idle_restart_fix,
         }
@@ -249,6 +254,9 @@ pub trait RecoveryOps {
     /// Maximum bandwidth estimate, if one is available.
     fn max_bandwidth(&self) -> Option<Bandwidth>;
 
+    /// Total number of confirmed persistent RTT jump episodes.
+    fn rtt_persistent_jump_count(&self) -> u64;
+
     /// Statistics from when a CCA first exited the startup phase.
     fn startup_exit(&self) -> Option<StartupExit>;
 
@@ -265,7 +273,7 @@ pub trait RecoveryOps {
     #[cfg(test)]
     fn largest_sent_pkt_num_on_path(&self, epoch: packet::Epoch) -> Option<u64>;
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qlog"))]
     fn app_limited(&self) -> bool;
 
     #[cfg(test)]
@@ -284,8 +292,8 @@ pub trait RecoveryOps {
     #[cfg(test)]
     fn pto_count(&self) -> u32;
 
-    // This value might be `None` when experiment `enable_relaxed_loss_threshold`
-    // is enabled for gcongestion
+    // This value might be `None` when the `enable_relaxed_loss_threshold`
+    // experiment is enabled for gcongestion.
     #[cfg(test)]
     fn pkt_thresh(&self) -> Option<u64>;
 
@@ -364,6 +372,10 @@ impl Recovery {
 ///
 /// This enum provides currently available list of congestion control
 /// algorithms.
+///
+/// The `congestion_window_unchecked_available` Cargo feature adds a variant to
+/// this enum. Cargo can enable it through another dependency, so exhaustive
+/// matches must account for the feature-enabled enum.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(C)]
 pub enum CongestionControlAlgorithm {
@@ -374,6 +386,28 @@ pub enum CongestionControlAlgorithm {
     /// BBRv2 congestion control algorithm implementation from gcongestion
     /// branch. `bbr2_gcongestion` in a string form.
     Bbr2Gcongestion = 4,
+    /// Uses a fixed congestion window instead of responding to congestion.
+    /// The window defaults to `usize::MAX` and can be set through
+    /// [`Config::set_unchecked_congestion_window()`]. ACK processing, RTT
+    /// estimation, loss detection, and recovery remain enabled. The default
+    /// window provides no congestion-window protection and, on 64-bit targets,
+    /// effectively disables packet-skipping optimistic-ACK probes.
+    ///
+    /// This intentionally bypasses adaptive congestion control ([RFC 9002,
+    /// Section 7]) and does not pace packets. Callers must provide their own
+    /// transmission constraints and pace or limit bursts ([RFC 9002,
+    /// Section 7.7]).
+    ///
+    /// `congestion_window_unchecked` in string form.
+    ///
+    /// [RFC 9002, Section 7]: https://www.rfc-editor.org/rfc/rfc9002.html#section-7
+    /// [RFC 9002, Section 7.7]: https://www.rfc-editor.org/rfc/rfc9002.html#section-7.7
+    #[cfg(feature = "congestion_window_unchecked_available")]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(feature = "congestion_window_unchecked_available"))
+    )]
+    CongestionWindowUnchecked = 5,
 }
 
 impl FromStr for CongestionControlAlgorithm {
@@ -389,6 +423,9 @@ impl FromStr for CongestionControlAlgorithm {
             "bbr" => Ok(CongestionControlAlgorithm::Bbr2Gcongestion),
             "bbr2" => Ok(CongestionControlAlgorithm::Bbr2Gcongestion),
             "bbr2_gcongestion" => Ok(CongestionControlAlgorithm::Bbr2Gcongestion),
+            #[cfg(feature = "congestion_window_unchecked_available")]
+            "congestion_window_unchecked" =>
+                Ok(CongestionControlAlgorithm::CongestionWindowUnchecked),
             _ => Err(crate::Error::CongestionControl),
         }
     }
@@ -490,6 +527,7 @@ struct QlogMetrics {
     lost_packets: Option<u64>,
     lost_bytes: Option<u64>,
     pto_count: Option<u32>,
+    app_limited: Option<bool>,
 }
 
 #[cfg(feature = "qlog")]
@@ -636,6 +674,13 @@ impl QlogMetrics {
 
         // Build ex_data for rate metrics
         let mut ex_data = CfExData::new();
+        if self.app_limited != latest.app_limited {
+            if let Some(app_limited) = latest.app_limited {
+                self.app_limited = latest.app_limited;
+                emit_event = true;
+                ex_data.insert("cf_app_limited", app_limited);
+            }
+        }
         if self.delivery_rate != latest.delivery_rate {
             if let Some(rate) = latest.delivery_rate {
                 self.delivery_rate = latest.delivery_rate;
@@ -830,7 +875,11 @@ mod tests {
     use crate::range_buf::RangeBuf;
     use crate::test_utils;
     use crate::CongestionControlAlgorithm;
+    #[cfg(feature = "congestion_window_unchecked_available")]
+    use crate::DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS;
     use crate::DEFAULT_INITIAL_RTT;
+    #[cfg(feature = "congestion_window_unchecked_available")]
+    use crate::MAX_SEND_UDP_PAYLOAD_SIZE;
     use rstest::rstest;
     use smallvec::smallvec;
     use std::str::FromStr;
@@ -839,6 +888,73 @@ mod tests {
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
         cfg.set_cc_algorithm(algo);
         Recovery::new(&cfg)
+    }
+
+    #[cfg(feature = "qlog")]
+    fn app_limited_value(event: EventData) -> Option<serde_json::Value> {
+        let EventData::QuicMetricsUpdated(metrics) = event else {
+            panic!("expected recovery metrics updated event");
+        };
+
+        metrics.ex_data.get("cf_app_limited").cloned()
+    }
+
+    #[cfg(feature = "qlog")]
+    #[test]
+    fn qlog_app_limited_emits_initial_false_and_transitions() {
+        let mut metrics = QlogMetrics::default();
+
+        let event = metrics
+            .maybe_update(QlogMetrics {
+                app_limited: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(app_limited_value(event), Some(false.into()));
+
+        let event = metrics
+            .maybe_update(QlogMetrics {
+                app_limited: Some(true),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(app_limited_value(event), Some(true.into()));
+
+        let event = metrics
+            .maybe_update(QlogMetrics {
+                app_limited: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(app_limited_value(event), Some(false.into()));
+    }
+
+    #[cfg(feature = "qlog")]
+    #[test]
+    fn qlog_app_limited_suppresses_unchanged_values() {
+        let mut metrics = QlogMetrics::default();
+        metrics
+            .maybe_update(QlogMetrics {
+                app_limited: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(metrics
+            .maybe_update(QlogMetrics {
+                app_limited: Some(false),
+                ..Default::default()
+            })
+            .is_none());
+
+        let event = metrics
+            .maybe_update(QlogMetrics {
+                cwnd: 1,
+                app_limited: Some(false),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(app_limited_value(event), None);
     }
 
     #[test]
@@ -873,10 +989,145 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "congestion_window_unchecked_available")]
+    #[test]
+    fn congestion_window_unchecked_discards_packet_space() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION)
+            .expect("create transport configuration");
+        config.set_cc_algorithm(
+            CongestionControlAlgorithm::CongestionWindowUnchecked,
+        );
+        let packet_size = config.max_send_udp_payload_size;
+        let window = packet_size * MINIMUM_WINDOW_PACKETS;
+        config.set_unchecked_congestion_window(window);
+        let mut recovery = Recovery::new(&config);
+        let now = Instant::now();
+        assert_eq!(recovery.cwnd(), window);
+        assert_eq!(recovery.cwnd_available(), window);
+        recovery.on_packet_sent(
+            test_utils::helper_packet_sent(0, now, packet_size),
+            packet::Epoch::Initial,
+            HandshakeStatus::default(),
+            now,
+            "",
+        );
+        assert_eq!(recovery.bytes_in_flight(), packet_size);
+        assert_eq!(recovery.cwnd(), window);
+        assert_eq!(recovery.cwnd_available(), window - packet_size);
+        recovery.on_pkt_num_space_discarded(
+            packet::Epoch::Initial,
+            HandshakeStatus::default(),
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(recovery.bytes_in_flight(), 0);
+        assert_eq!(recovery.cwnd(), window);
+        assert_eq!(recovery.cwnd_available(), window);
+    }
+
+    #[cfg(feature = "congestion_window_unchecked_available")]
+    #[test]
+    fn congestion_window_unchecked_uses_configured_capacity() {
+        let mut config = Config::new(crate::PROTOCOL_VERSION)
+            .expect("create transport configuration");
+        config.set_cc_algorithm(
+            CongestionControlAlgorithm::CongestionWindowUnchecked,
+        );
+        let window = config.max_send_udp_payload_size * 2;
+        config.set_unchecked_congestion_window(window);
+        let mut recovery = Recovery::new(&config);
+        let now = Instant::now();
+
+        assert_eq!(recovery.cwnd(), window);
+        assert_eq!(recovery.cwnd_available(), window);
+        for packet_number in 0..2 {
+            recovery.on_packet_sent(
+                test_utils::helper_packet_sent(
+                    packet_number,
+                    now,
+                    config.max_send_udp_payload_size,
+                ),
+                packet::Epoch::Application,
+                HandshakeStatus::default(),
+                now,
+                "",
+            );
+        }
+        assert_eq!(recovery.cwnd(), window);
+        assert_eq!(recovery.cwnd_available(), 0);
+        let mut acked = RangeSet::default();
+        acked.insert(0..2);
+        recovery
+            .on_ack_received(
+                &acked,
+                0,
+                packet::Epoch::Application,
+                HandshakeStatus::default(),
+                now + Duration::from_millis(100),
+                None,
+                "",
+            )
+            .expect("acknowledge outstanding packets");
+        assert_eq!(recovery.cwnd(), window);
+        assert_eq!(recovery.cwnd_available(), window);
+    }
+
     #[rstest]
-    fn loss_on_pto(
-        #[values("reno", "cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+    fn unchecked_window_configuration_does_not_change_other_algorithms(
+        #[values("reno", "cubic", "bbr2_gcongestion")] algorithm: &str,
     ) {
+        let mut config = Config::new(crate::PROTOCOL_VERSION)
+            .expect("create transport configuration");
+        config
+            .set_cc_algorithm_name(algorithm)
+            .expect("select congestion control algorithm");
+        config.set_unchecked_congestion_window(40 * 1024 * 1024);
+        let recovery = Recovery::new(&config);
+        assert_eq!(
+            recovery.cwnd(),
+            config.max_send_udp_payload_size *
+                config.initial_congestion_window_packets,
+        );
+    }
+
+    #[cfg(feature = "congestion_window_unchecked_available")]
+    #[rstest]
+    fn unchecked_window_is_fixed_across_mtu_updates(
+        #[values(
+            usize::MAX,
+            MAX_SEND_UDP_PAYLOAD_SIZE * DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS,
+            MAX_SEND_UDP_PAYLOAD_SIZE * DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS + 1
+        )]
+        window: usize,
+    ) {
+        let mut config = Config::new(crate::PROTOCOL_VERSION)
+            .expect("create transport configuration");
+        config.set_cc_algorithm(
+            CongestionControlAlgorithm::CongestionWindowUnchecked,
+        );
+        config.set_max_send_udp_payload_size(MAX_SEND_UDP_PAYLOAD_SIZE);
+        config.set_unchecked_congestion_window(window);
+        let mut recovery = Recovery::new(&config);
+
+        recovery.pmtud_update_max_datagram_size(MAX_SEND_UDP_PAYLOAD_SIZE + 200);
+        assert_eq!(recovery.cwnd(), window);
+        assert_eq!(
+            recovery.max_datagram_size(),
+            MAX_SEND_UDP_PAYLOAD_SIZE + 200
+        );
+        recovery.update_max_datagram_size(MAX_SEND_UDP_PAYLOAD_SIZE);
+        assert_eq!(recovery.cwnd(), window);
+        assert_eq!(recovery.max_datagram_size(), MAX_SEND_UDP_PAYLOAD_SIZE);
+    }
+
+    #[rstest]
+    #[case::reno("reno")]
+    #[case::cubic("cubic")]
+    #[case::bbr2_gcongestion("bbr2_gcongestion")]
+    #[cfg_attr(
+        feature = "congestion_window_unchecked_available",
+        case::congestion_window_unchecked("congestion_window_unchecked")
+    )]
+    fn loss_on_pto(#[case] cc_algorithm_name: &str) {
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
         assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
 
@@ -1151,7 +1402,7 @@ mod tests {
         );
 
         assert_eq!(r.sent_packets_len(packet::Epoch::Application), 0);
-        if cc_algorithm_name == "reno" || cc_algorithm_name == "cubic" {
+        if matches!(cc_algorithm_name, "reno" | "cubic") {
             assert!(r.startup_exit().is_some());
             assert_eq!(r.startup_exit().unwrap().reason, StartupExitReason::Loss);
         } else {
@@ -1160,9 +1411,14 @@ mod tests {
     }
 
     #[rstest]
-    fn loss_on_timer(
-        #[values("reno", "cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
-    ) {
+    #[case::reno("reno")]
+    #[case::cubic("cubic")]
+    #[case::bbr2_gcongestion("bbr2_gcongestion")]
+    #[cfg_attr(
+        feature = "congestion_window_unchecked_available",
+        case::congestion_window_unchecked("congestion_window_unchecked")
+    )]
+    fn loss_on_timer(#[case] cc_algorithm_name: &str) {
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
         assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
 
@@ -1347,7 +1603,7 @@ mod tests {
         );
 
         assert_eq!(r.sent_packets_len(packet::Epoch::Application), 0);
-        if cc_algorithm_name == "reno" || cc_algorithm_name == "cubic" {
+        if matches!(cc_algorithm_name, "reno" | "cubic") {
             assert!(r.startup_exit().is_some());
             assert_eq!(r.startup_exit().unwrap().reason, StartupExitReason::Loss);
         } else {
@@ -1356,13 +1612,19 @@ mod tests {
     }
 
     #[rstest]
-    fn loss_on_reordering(
-        #[values("reno", "cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
-    ) {
+    #[case::reno("reno")]
+    #[case::cubic("cubic")]
+    #[case::bbr2_gcongestion("bbr2_gcongestion")]
+    #[cfg_attr(
+        feature = "congestion_window_unchecked_available",
+        case::congestion_window_unchecked("congestion_window_unchecked")
+    )]
+    fn loss_on_reordering(#[case] cc_algorithm_name: &str) {
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
         assert_eq!(cfg.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
 
         let mut r = Recovery::new(&cfg);
+        let initial_cwnd = r.cwnd();
 
         let mut now = Instant::now();
 
@@ -1385,6 +1647,10 @@ mod tests {
             assert_eq!(r.sent_packets_len(packet::Epoch::Application), pkt_count);
             assert_eq!(r.bytes_in_flight(), pkt_count * 1000);
             assert_eq!(r.bytes_in_flight_duration(), Duration::ZERO);
+            if cc_algorithm_name == "congestion_window_unchecked" {
+                assert_eq!(r.cwnd(), usize::MAX);
+                assert_eq!(r.cwnd_available(), usize::MAX - r.bytes_in_flight());
+            }
         }
 
         // Wait for 10ms after sending.
@@ -1411,6 +1677,11 @@ mod tests {
                 spurious_losses: 0,
             }
         );
+        if cc_algorithm_name == "congestion_window_unchecked" {
+            assert_eq!(r.cwnd(), initial_cwnd);
+            assert_eq!(r.rtt(), Duration::from_millis(10));
+            assert_eq!(r.min_rtt(), Some(Duration::from_millis(10)));
+        }
         // Since we only remove packets from the back to avoid compaction, the
         // send length remains the same after receiving reordered ACKs
         assert_eq!(r.sent_packets_len(packet::Epoch::Application), 4);
@@ -1441,6 +1712,9 @@ mod tests {
                 spurious_losses: 1,
             }
         );
+        if cc_algorithm_name == "congestion_window_unchecked" {
+            assert_eq!(r.cwnd(), initial_cwnd);
+        }
         assert_eq!(r.sent_packets_len(packet::Epoch::Application), 0);
         assert_eq!(r.bytes_in_flight(), 0);
         assert_eq!(r.bytes_in_flight_duration(), Duration::from_millis(20));
@@ -1463,7 +1737,7 @@ mod tests {
         );
         assert_eq!(r.sent_packets_len(packet::Epoch::Application), 0);
 
-        if cc_algorithm_name == "reno" || cc_algorithm_name == "cubic" {
+        if matches!(cc_algorithm_name, "reno" | "cubic") {
             assert!(r.startup_exit().is_some());
             assert_eq!(r.startup_exit().unwrap().reason, StartupExitReason::Loss);
         } else {
@@ -1486,9 +1760,9 @@ mod tests {
         let mut r = Recovery::new(&cfg);
         assert_eq!(r.rtt(), DEFAULT_INITIAL_RTT);
 
-        // Pick time between and above thresholds for testing threshold increase.
+        // Choose times around the threshold to test its increase.
         //
-        //```
+        // ```
         //              between_thresh_ms
         //                         |
         //    initial_thresh_ms    |     spurious_thresh_ms
@@ -1497,7 +1771,7 @@ mod tests {
         //      | ................ | ..................... |
         //            THRESH_GAP         THRESH_GAP
         // ```
-        // 
+        //
         // Threshold gap time.
         const THRESH_GAP: Duration = Duration::from_millis(30);
         // Initial time theshold based on inital RTT.
@@ -1647,8 +1921,8 @@ mod tests {
         );
     }
 
-    // TODO: Implement enable_relaxed_loss_threshold and enable this test for the
-    // congestion module.
+    // TODO: Implement `enable_relaxed_loss_threshold` and enable this test for
+    // the congestion module.
     #[rstest]
     fn relaxed_thresholds_on_reordering(
         #[values("bbr2_gcongestion")] cc_algorithm_name: &str,
@@ -1661,9 +1935,9 @@ mod tests {
         let mut r = Recovery::new(&cfg);
         assert_eq!(r.rtt(), DEFAULT_INITIAL_RTT);
 
-        // Pick time between and above thresholds for testing threshold increase.
+        // Choose times around the threshold to test its increase.
         //
-        //```
+        // ```
         //              between_thresh_ms
         //                         |
         //    initial_thresh_ms    |     spurious_thresh_ms
@@ -2611,9 +2885,14 @@ mod tests {
     }
 
     #[rstest]
-    fn acks_with_no_retransmittable_data(
-        #[values("reno", "cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
-    ) {
+    #[case::reno("reno")]
+    #[case::cubic("cubic")]
+    #[case::bbr2_gcongestion("bbr2_gcongestion")]
+    #[cfg_attr(
+        feature = "congestion_window_unchecked_available",
+        case::congestion_window_unchecked("congestion_window_unchecked")
+    )]
+    fn acks_with_no_retransmittable_data(#[case] cc_algorithm_name: &str) {
         let rtt = Duration::from_millis(100);
 
         let mut cfg = Config::new(crate::PROTOCOL_VERSION).unwrap();
@@ -2652,8 +2931,13 @@ mod tests {
             },
         );
         assert_eq!(r.get_packet_send_time(now), now);
-        assert_eq!(r.cwnd(), 12000);
-        assert_eq!(r.cwnd_available(), 8400);
+        let initial_cwnd = if cc_algorithm_name == "congestion_window_unchecked" {
+            usize::MAX
+        } else {
+            12000
+        };
+        assert_eq!(r.cwnd(), initial_cwnd);
+        assert_eq!(r.cwnd_available(), initial_cwnd - r.bytes_in_flight());
 
         // Wait 1 rtt for ACK.
         now += rtt;
@@ -2684,6 +2968,10 @@ mod tests {
         assert_eq!(r.bytes_in_flight(), 0);
         assert_eq!(r.bytes_in_flight_duration(), rtt);
         assert_eq!(r.rtt(), rtt);
+        if cc_algorithm_name == "congestion_window_unchecked" {
+            assert_eq!(r.cwnd(), usize::MAX);
+            assert_eq!(r.min_rtt(), Some(rtt));
+        }
 
         // Pacing rate is recalculated based on initial cwnd when the
         // first RTT estimate is available.
@@ -2834,8 +3122,8 @@ mod tests {
         );
 
         // 3. Acknowledge the Initial packet.
-        // This empties the Initial space, but Application space still has data in
-        // flight.
+        // This empties the Initial space, but Application space still has data
+        // in flight.
         let mut ranges = RangeSet::default();
         ranges.insert(0..1);
         r.on_ack_received(

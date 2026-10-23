@@ -372,6 +372,9 @@
 //!   initiating a connection. Dangerous if the DCID does not meet QUIC's
 //!   unpredictability and length requirements.
 //!
+//! * `congestion_window_unchecked_available`: Expose a congestion control
+//!   algorithm with a fixed, configurable window that defaults to `usize::MAX`.
+//!
 //! [feature flags]: https://doc.rust-lang.org/cargo/reference/manifest.html#the-features-section
 //! [boring]: https://crates.io/crates/boring
 //! [qlog]: https://datatracker.ietf.org/doc/html/draft-ietf-quic-qlog-main-schema
@@ -440,7 +443,7 @@ const PROTOCOL_VERSION_V1: u32 = 0x0000_0001;
 pub const MAX_CONN_ID_LEN: usize = packet::MAX_CID_LEN as usize;
 
 /// The minimum length of Initial packets sent by a client.
-pub const MIN_CLIENT_INITIAL_LEN: usize = 1242;
+pub const MIN_CLIENT_INITIAL_LEN: usize = 1200;
 
 /// The default initial RTT.
 const DEFAULT_INITIAL_RTT: Duration = Duration::from_millis(333);
@@ -497,6 +500,11 @@ const DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS: usize = 10;
 
 // The maximum data offset that can be stored in a crypto stream.
 const MAX_CRYPTO_STREAM_OFFSET: u64 = 1 << 16;
+
+// TODO: Remove once https://github.com/cloudflare/quiche/pull/2453 is done.
+// Preserve the previous app-limited threshold independently of STREAM frame
+// header sizing.
+const LEGACY_APP_LIMITED_BYTE_THRESHOLD: usize = 12;
 
 // The send capacity factor.
 const TX_CAP_FACTOR: f64 = 1.0;
@@ -573,6 +581,7 @@ pub struct Config {
     cc_algorithm: CongestionControlAlgorithm,
     custom_bbr_params: Option<BbrParams>,
     initial_congestion_window_packets: usize,
+    unchecked_congestion_window: usize,
     enable_relaxed_loss_threshold: bool,
     enable_cubic_idle_restart_fix: bool,
     enable_send_streams_blocked: bool,
@@ -637,7 +646,7 @@ impl Config {
     pub fn with_boring_ssl_ctx_builder(
         version: u32, tls_ctx_builder: boring::ssl::SslContextBuilder,
     ) -> Result<Config> {
-        Self::with_tls_ctx(version, tls::Context::from_boring(tls_ctx_builder))
+        Self::with_tls_ctx(version, tls::Context::from_boring(tls_ctx_builder)?)
     }
 
     fn with_tls_ctx(version: u32, tls_ctx: tls::Context) -> Result<Config> {
@@ -655,6 +664,7 @@ impl Config {
             custom_bbr_params: None,
             initial_congestion_window_packets:
                 DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS,
+            unchecked_congestion_window: usize::MAX,
             enable_relaxed_loss_threshold: false,
             enable_cubic_idle_restart_fix: true,
             enable_send_streams_blocked: false,
@@ -751,6 +761,16 @@ impl Config {
         self.tls_ctx.load_verify_locations_from_directory(dir)
     }
 
+    /// Configures the TLS curve preference list.
+    ///
+    /// `curves` is a colon-separated list of curve (a.k.a. group) names, in
+    /// order of preference, e.g. `"X25519MLKEM768:X25519:P-256:P-384"`.
+    /// Corresponds to `SSL_CTX_set1_curves_list` (a.k.a.
+    /// `SSL_CTX_set1_groups_list`).
+    pub fn set_curves_list(&mut self, curves: &str) -> Result<()> {
+        self.tls_ctx.set_curves_list(curves)
+    }
+
     /// Configures whether to verify the peer's certificate.
     ///
     /// This should usually be `true` for client-side connections and `false`
@@ -771,6 +791,9 @@ impl Config {
     }
 
     /// Configures whether to do path MTU discovery.
+    ///
+    /// PMTUD-driven packet limit updates are reported to the application
+    /// through [`PathEvent::PmtuUpdated`].
     ///
     /// The default value is `false`.
     pub fn discover_pmtu(&mut self, discover: bool) {
@@ -1119,6 +1142,23 @@ impl Config {
     /// The default value is 10.
     pub fn set_initial_congestion_window_packets(&mut self, packets: usize) {
         self.initial_congestion_window_packets = packets;
+    }
+
+    /// Sets the fixed congestion window in bytes for the
+    /// `congestion_window_unchecked` algorithm.
+    ///
+    /// The default is `usize::MAX`. Other congestion control algorithms ignore
+    /// this setting. Recovery probes can temporarily bypass this window.
+    ///
+    /// Values are not clamped. Zero can prevent connection establishment, and
+    /// windows too small for outgoing packets or PMTU probes can stall
+    /// transmission. At least two maximum-sized datagrams are recommended.
+    ///
+    /// This API is available even when the
+    /// `congestion_window_unchecked_available` feature is disabled, in which
+    /// case the setting has no effect.
+    pub fn set_unchecked_congestion_window(&mut self, window: usize) {
+        self.unchecked_congestion_window = window;
     }
 
     /// Configure whether to enable relaxed loss detection on spurious loss.
@@ -1619,18 +1659,17 @@ pub fn accept(
     accept_with_buf_factory(scid, odcid, local, peer, config)
 }
 
-/// Creates a new server-side connection, with a custom buffer generation
-/// method.
+/// Creates a server-side connection with custom buffer generation.
 ///
-/// The buffers generated can be anything that can be drereferenced as a byte
-/// slice. See [`accept`] and [`BufFactory`] for more info.
+/// The buffers generated can be anything that can be dereferenced as a byte
+/// slice. See [`accept`] and [`BufFactory`] for more information.
 #[inline]
 pub fn accept_with_buf_factory<F: BufFactory>(
     scid: &ConnectionId, odcid: Option<&ConnectionId>, local: SocketAddr,
     peer: SocketAddr, config: &mut Config,
 ) -> Result<Connection<F>> {
-    // For connections with `odcid` set, we historically used `retry_source_cid =
-    // scid`. Keep this behavior to preserve backwards compatibility.
+    // Connections with `odcid` historically used `scid` as the retry source
+    // CID. Preserve this behavior for backwards compatibility.
     // `accept_with_retry` allows the SCIDs to be specified separately.
     let retry_cids = odcid.map(|odcid| RetryConnectionIds {
         original_destination_cid: odcid,
@@ -2755,7 +2794,7 @@ impl<F: BufFactory> Connection<F> {
         // a borrowed view of `ssl`. The caller retains ownership of the
         // underlying BoringSSL object.
         let mut handshake = ManuallyDrop::new(unsafe {
-            tls::Handshake::from_ptr(ssl.as_ptr() as _)
+            tls::Handshake::from_ptr(ssl.as_ptr() as _)?
         });
 
         handshake.set_quic_transport_params(&params, is_server)
@@ -3303,8 +3342,8 @@ impl<F: BufFactory> Connection<F> {
                         .derive_next_packet_key()?,
                 ));
 
-                // `aead_next` is always `Some()` at this point, so the `unwrap()`
-                // will never fail.
+                // `aead_next` is always `Some` at this point, so the
+                // `unwrap()` will never fail.
                 aead = &aead_next.as_ref().unwrap().0;
             }
         }
@@ -3522,24 +3561,29 @@ impl<F: BufFactory> Connection<F> {
 
         // Process acked frames. Note that several packets from several paths
         // might have been acked by the received packet.
-        for (_, p) in self.paths.iter_mut() {
+        let (paths, path_events) = self.paths.iter_mut_and_events();
+        for (_, p) in paths {
             while let Some(acked) = p.recovery.next_acked_frame(epoch) {
                 match acked {
                     frame::Frame::Ping {
                         mtu_probe: Some(mtu_probe),
                     } => {
-                        if let Some(pmtud) = p.pmtud.as_mut() {
-                            trace!(
-                                "{} pmtud probe acked; probe size {:?}",
-                                self.trace_id,
-                                mtu_probe
-                            );
+                        trace!(
+                            "{} pmtud probe acked; probe size {:?}",
+                            self.trace_id,
+                            mtu_probe
+                        );
 
-                            // Ensure the probe is within the supported MTU range
-                            // before updating the max datagram size
-                            if let Some(current_mtu) =
-                                pmtud.successful_probe(mtu_probe)
-                            {
+                        let local = p.local_addr();
+                        let peer = p.peer_addr();
+                        if let Some(pmtud) = p.pmtud.as_mut() {
+                            let old_pmtu = pmtud.get_current_mtu();
+                            let current_mtu = pmtud.successful_probe(mtu_probe);
+                            let new_pmtu = pmtud.get_current_mtu();
+
+                            // Update the datagram size only after validating
+                            // the MTU.
+                            if let Some(current_mtu) = current_mtu {
                                 qlog_with_type!(
                                     EventType::QuicEventType(
                                         QuicEventType::MtuUpdated
@@ -3568,6 +3612,12 @@ impl<F: BufFactory> Connection<F> {
                                 p.recovery
                                     .pmtud_update_max_datagram_size(current_mtu);
                             }
+
+                            if let Some(event) =
+                                path::pmtu_event(local, peer, old_pmtu, new_pmtu)
+                            {
+                                path_events.push_back(event);
+                            }
                         }
                     },
 
@@ -3593,7 +3643,7 @@ impl<F: BufFactory> Connection<F> {
                         stream_id,
                         offset,
                         length,
-                        ..
+                        fin,
                     } => {
                         // Emit qlog before checking if the stream still exists.
                         // The client does need to ACK frames that were received
@@ -3624,43 +3674,16 @@ impl<F: BufFactory> Connection<F> {
                         };
 
                         let dropped = stream.send.ack_and_drop(offset, length);
-                        let priority_key = Arc::clone(&stream.priority_key);
 
-                        // Only collect the stream if it is complete and not
-                        // readable or writable.
-                        //
-                        // If it is readable, it will get collected when
-                        // stream_recv() is next used.
-                        //
-                        // If it is writable, it might mean that the stream
-                        // has been stopped by the peer (i.e. a STOP_SENDING
-                        // frame is received), in which case before collecting
-                        // the stream we will need to propagate the
-                        // `StreamStopped` error to the application. It will
-                        // instead get collected when one of stream_capacity(),
-                        // stream_writable(), stream_send(), ... is next called.
-                        //
-                        // Note that we can't use `is_writable()` here because
-                        // it returns false if the stream is stopped. Instead,
-                        // since the stream is marked as writable when a
-                        // STOP_SENDING frame is received, we check the writable
-                        // queue directly instead.
-                        let is_writable = priority_key.writable.is_linked() &&
-                            // Ensure that the stream is actually stopped.
-                            stream.send.is_stopped();
-
-                        let is_complete = stream.is_complete();
-                        let is_readable = stream.is_readable();
-
-                        if is_complete && !is_readable && !is_writable {
-                            let local = stream.local;
-                            self.streams.collect(stream_id, local);
+                        if fin {
+                            stream.send.ack_fin();
                         }
 
-                        // Update tx_bufferd to reflect any data that was dropped
-                        // from stream buffers (e.g., data
-                        // marked for retransmission but then
-                        // acked before it could be resent).
+                        self.streams.try_collect(stream_id);
+
+                        // Update `tx_buffered` for data dropped from stream
+                        // buffers, such as retransmission data acknowledged
+                        // before it could be resent.
                         if dropped > 0 {
                             self.streams.sub_tx_buffered(dropped);
                         }
@@ -3675,44 +3698,7 @@ impl<F: BufFactory> Connection<F> {
                     },
 
                     frame::Frame::ResetStream { stream_id, .. } => {
-                        let stream = match self.streams.get_mut(stream_id) {
-                            Some(v) => v,
-
-                            None => continue,
-                        };
-
-                        let priority_key = Arc::clone(&stream.priority_key);
-
-                        // Only collect the stream if it is complete and not
-                        // readable or writable.
-                        //
-                        // If it is readable, it will get collected when
-                        // stream_recv() is next used.
-                        //
-                        // If it is writable, it might mean that the stream
-                        // has been stopped by the peer (i.e. a STOP_SENDING
-                        // frame is received), in which case before collecting
-                        // the stream we will need to propagate the
-                        // `StreamStopped` error to the application. It will
-                        // instead get collected when one of stream_capacity(),
-                        // stream_writable(), stream_send(), ... is next called.
-                        //
-                        // Note that we can't use `is_writable()` here because
-                        // it returns false if the stream is stopped. Instead,
-                        // since the stream is marked as writable when a
-                        // STOP_SENDING frame is received, we check the writable
-                        // queue directly instead.
-                        let is_writable = priority_key.writable.is_linked() &&
-                            // Ensure that the stream is actually stopped.
-                            stream.send.is_stopped();
-
-                        let is_complete = stream.is_complete();
-                        let is_readable = stream.is_readable();
-
-                        if is_complete && !is_readable && !is_writable {
-                            let local = stream.local;
-                            self.streams.collect(stream_id, local);
-                        }
+                        self.streams.try_collect(stream_id);
                     },
 
                     _ => (),
@@ -4004,7 +3990,7 @@ impl<F: BufFactory> Connection<F> {
 
         let send_path = self.paths.get_mut(send_pid)?;
 
-        // Update max datagram size to allow path MTU discovery probe to be sent.
+        // Increase the maximum datagram size for a PMTUD probe.
         if let Some(pmtud) = send_path.pmtud.as_mut() {
             if pmtud.should_probe() {
                 let size = if self.handshake_confirmed || self.handshake_completed
@@ -4110,13 +4096,67 @@ impl<F: BufFactory> Connection<F> {
             return Err(Error::Done);
         }
 
+        let has_loss_probe = {
+            let send_path = self.paths.get(send_pid)?;
+
+            packet::Epoch::epochs(
+                packet::Epoch::Initial..=packet::Epoch::Application,
+            )
+            .iter()
+            .any(|&epoch| send_path.recovery.loss_probes(epoch) > 0)
+        };
+
+        if self.local_error.is_none() {
+            for &epoch in packet::Epoch::epochs(
+                packet::Epoch::Initial..=packet::Epoch::Application,
+            ) {
+                let has_probe = self.crypto_ctx[epoch].crypto_seal.is_some() &&
+                    self.paths.get(send_pid)?.recovery.loss_probes(epoch) > 0;
+
+                if !has_probe {
+                    continue;
+                }
+
+                match self.send_single_for_type(
+                    out,
+                    send_pid,
+                    has_initial,
+                    now,
+                    Type::from_epoch(epoch),
+                    true,
+                ) {
+                    Err(Error::Done) => (),
+
+                    result => return result,
+                }
+            }
+        }
+
+        let pkt_type = self.write_pkt_type(send_pid)?;
+        let epoch = pkt_type.to_epoch()?;
+        let bypass_cwnd = self.paths.get(send_pid)?.recovery.loss_probes(epoch) >
+            0 ||
+            (self.local_error.is_some() && has_loss_probe);
+
+        self.send_single_for_type(
+            out,
+            send_pid,
+            has_initial,
+            now,
+            pkt_type,
+            bypass_cwnd,
+        )
+    }
+
+    fn send_single_for_type(
+        &mut self, out: &mut [u8], send_pid: usize, has_initial: bool,
+        now: Instant, pkt_type: Type, bypass_cwnd: bool,
+    ) -> Result<(Type, usize)> {
         let is_closing = self.local_error.is_some();
 
         let out_len = out.len();
 
         let mut b = octets::OctetsMut::with_slice(out);
-
-        let pkt_type = self.write_pkt_type(send_pid)?;
 
         let max_dgram_len = if !self.dgram_send_queue.is_empty() {
             self.dgram_max_writable_len()
@@ -4129,7 +4169,8 @@ impl<F: BufFactory> Connection<F> {
         let crypto_ctx = &mut self.crypto_ctx[epoch];
 
         // Process lost frames. There might be several paths having lost frames.
-        for (_, p) in self.paths.iter_mut() {
+        let (paths, path_events) = self.paths.iter_mut_and_events();
+        for (_, p) in paths {
             while let Some(lost) = p.recovery.next_lost_frame(epoch) {
                 match lost {
                     frame::Frame::CryptoHeader { offset, length } => {
@@ -4151,7 +4192,12 @@ impl<F: BufFactory> Connection<F> {
                         let stream = match self.streams.get_mut(stream_id) {
                             // Only retransmit data if the stream is not closed
                             // or stopped.
-                            Some(v) if !v.send.is_stopped() => v,
+                            Some(v)
+                                if !v
+                                    .send
+                                    .peer_stop_sending_state()
+                                    .is_stopped() =>
+                                v,
 
                             // Data on a closed stream will not be retransmitted
                             // or acked after it is declared lost, so just drop
@@ -4293,9 +4339,22 @@ impl<F: BufFactory> Connection<F> {
                     frame::Frame::Ping { mtu_probe } => {
                         // Ping frames are not retransmitted.
                         if let Some(failed_probe) = mtu_probe {
+                            trace!("pmtud probe dropped: {failed_probe}");
+
+                            let local = p.local_addr();
+                            let peer = p.peer_addr();
                             if let Some(pmtud) = p.pmtud.as_mut() {
-                                trace!("pmtud probe dropped: {failed_probe}");
+                                let old_pmtu = pmtud.get_current_mtu();
                                 pmtud.failed_probe(failed_probe);
+                                let new_pmtu = pmtud.get_current_mtu();
+
+                                if let Some(event) = path::pmtu_event(
+                                    local, peer, old_pmtu, new_pmtu,
+                                ) {
+                                    p.recovery
+                                        .pmtud_update_max_datagram_size(new_pmtu);
+                                    path_events.push_back(event);
+                                }
                             }
                         }
                     },
@@ -4495,10 +4554,12 @@ impl<F: BufFactory> Connection<F> {
         let mut in_flight = false;
         let mut is_pmtud_probe = false;
         let mut has_data = false;
+        let mut stream_data_skipped = false;
 
-        // Whether or not we should explicitly elicit an ACK via PING frame if we
-        // implicitly elicit one otherwise.
-        let ack_elicit_required = path.recovery.should_elicit_ack(epoch);
+        // Whether a PING frame must explicitly elicit an ACK when no other
+        // frame does so implicitly.
+        let ack_elicit_required =
+            !is_closing && path.recovery.should_elicit_ack(epoch);
 
         let header_offset = b.off();
 
@@ -4514,8 +4575,15 @@ impl<F: BufFactory> Connection<F> {
 
         let payload_offset = b.off();
 
-        let cwnd_available =
-            path.recovery.cwnd_available().saturating_sub(overhead);
+        // `usize::MAX` bypasses cwnd when authorized by packet selection;
+        // `left` still bounds the packet. Keep this local so other cwnd users
+        // see the actual window.
+        let send_limit_from_cwnd = if bypass_cwnd {
+            usize::MAX
+        } else {
+            path.recovery.cwnd_available()
+        }
+        .saturating_sub(overhead);
 
         let left_before_packing_ack_frame = left;
 
@@ -4525,6 +4593,9 @@ impl<F: BufFactory> Connection<F> {
         // generate an ACK (if there's anything to ACK) since we're going to
         // send a packet with PING anyways, even if we haven't received anything
         // ACK eliciting.
+        //
+        // While closing, PING frames are suppressed, so ACK elicitation must
+        // not generate ACK-only packets.
         if pkt_space.recv_pkt_need_ack.len() > 0 &&
             (pkt_space.ack_elicited || ack_elicit_required) &&
             (!is_closing ||
@@ -4556,7 +4627,7 @@ impl<F: BufFactory> Connection<F> {
             // there is not enough cwnd available for both (note that PING
             // frames are always 1 byte, so we just need to check that the
             // ACK's length is lower than cwnd).
-            if pkt_space.ack_elicited || frame.wire_len() < cwnd_available {
+            if pkt_space.ack_elicited || frame.wire_len() < send_limit_from_cwnd {
                 // ACK-only packets are not congestion controlled so ACKs must
                 // be bundled considering the buffer capacity only, and not the
                 // available cwnd.
@@ -4570,7 +4641,8 @@ impl<F: BufFactory> Connection<F> {
         left = cmp::min(
             left,
             // Bytes consumed by ACK frames.
-            cwnd_available.saturating_sub(left_before_packing_ack_frame - left),
+            send_limit_from_cwnd
+                .saturating_sub(left_before_packing_ack_frame - left),
         );
 
         let mut challenge_data = None;
@@ -4578,15 +4650,12 @@ impl<F: BufFactory> Connection<F> {
         if pkt_type == Type::Short {
             // Create PMTUD probe.
             //
-            // In order to send a PMTUD probe the current `left` value, which was
-            // already limited by the current PMTU measure, needs to be ignored,
-            // but the outgoing packet still needs to be limited by
-            // the output buffer size, as well as the congestion
-            // window.
+            // A PMTUD probe must ignore `left`, which is already limited by the
+            // current PMTU. The probe remains limited by the output buffer and
+            // congestion window.
             //
-            // In addition, the PMTUD probe is only generated when the handshake
-            // is confirmed, to avoid interfering with the handshake
-            // (e.g. due to the anti-amplification limits).
+            // Generate PMTUD probes only after handshake confirmation to avoid
+            // interference from anti-amplification limits.
             if let Ok(active_path) = self.paths.get_active_mut() {
                 let should_probe_pmtu = active_path.should_send_pmtu_probe(
                     self.handshake_confirmed,
@@ -4615,11 +4684,11 @@ impl<F: BufFactory> Connection<F> {
                                 // We can't send more because there isn't enough
                                 // space available in the output buffer.
                                 //
-                                // This usually happens when we try to send a new
-                                // packet but failed because cwnd is almost full.
+                                // The congestion window is nearly full. A new
+                                // packet does not fit.
                                 //
-                                // In such case app_limited is set to false here
-                                // to make cwnd grow when ACK is received.
+                                // Clear the app-limited state so ACKs can grow
+                                // the congestion window.
                                 active_path.recovery.update_app_limited(false);
                                 return Err(Error::Done);
                             },
@@ -5172,7 +5241,6 @@ impl<F: BufFactory> Connection<F> {
 
         // Create a single STREAM frame for the first stream that is flushable.
         if (pkt_type == Type::Short || pkt_type == Type::ZeroRTT) &&
-            left > frame::MAX_STREAM_OVERHEAD &&
             !is_closing &&
             path.active() &&
             !dgram_emitted
@@ -5184,7 +5252,8 @@ impl<F: BufFactory> Connection<F> {
                     //
                     // This might happen if stream data was buffered but not yet
                     // flushed on the wire when a STOP_SENDING frame is received.
-                    Some(v) if !v.send.is_stopped() => v,
+                    Some(v) if !v.send.peer_stop_sending_state().is_stopped() =>
+                        v,
                     _ => {
                         self.streams.remove_flushable(&priority_key);
                         continue;
@@ -5212,13 +5281,21 @@ impl<F: BufFactory> Connection<F> {
                     octets::varint_len(stream_off) + // offset
                     2; // length, always encode as 2-byte varint
 
+                // A non-FIN STREAM frame must carry at least one byte. If the
+                // header and payload don't fit, leave the stream flushable for
+                // a later packet. Empty FIN frames only need the header.
                 let max_len = match left.checked_sub(hdr_len) {
-                    Some(v) => v,
-                    None => {
-                        let priority_key = Arc::clone(&stream.priority_key);
-                        self.streams.remove_flushable(&priority_key);
+                    Some(v) if v > 0 || stream.send.empty_fin_next() => v,
+                    _ => {
+                        stream_data_skipped = true;
 
-                        continue;
+                        if stream.incremental {
+                            let priority_key = Arc::clone(&stream.priority_key);
+                            self.streams.remove_flushable(&priority_key);
+                            self.streams.insert_flushable(&priority_key);
+                        }
+
+                        break;
                     },
                 };
 
@@ -5228,6 +5305,16 @@ impl<F: BufFactory> Connection<F> {
                 // Write stream data into the packet buffer.
                 let (len, fin) =
                     stream.send.emit(&mut stream_payload.as_mut()[..max_len])?;
+
+                // ACK processing can leave a stream in the flushable queue
+                // after removing all of its retransmission data. Unlink the
+                // stale entry and continue with the next stream;
+                // future retransmits or writedata will queue the stream again.
+                if len == 0 && !fin {
+                    let priority_key = Arc::clone(&stream.priority_key);
+                    self.streams.remove_flushable(&priority_key);
+                    continue;
+                }
 
                 // Encode the frame's header.
                 //
@@ -5262,7 +5349,7 @@ impl<F: BufFactory> Connection<F> {
                 }
 
                 let priority_key = Arc::clone(&stream.priority_key);
-                // If the stream is no longer flushable, remove it from the queue
+                // Remove the stream when it is no longer flushable.
                 if !stream.is_flushable() {
                     self.streams.remove_flushable(&priority_key);
                 } else if stream.incremental {
@@ -5277,10 +5364,9 @@ impl<F: BufFactory> Connection<F> {
 
                 #[cfg(feature = "fuzzing")]
                 // Coalesce STREAM frames when fuzzing.
-                if left > frame::MAX_STREAM_OVERHEAD {
-                    continue;
-                }
+                continue;
 
+                #[cfg(not(feature = "fuzzing"))]
                 break;
             }
         }
@@ -5311,9 +5397,11 @@ impl<F: BufFactory> Connection<F> {
             path.recovery.ping_sent(epoch);
         }
 
+        // Pending stream data means the sender is size-, not app-limited.
         if !has_data &&
+            !stream_data_skipped &&
             !dgram_emitted &&
-            cwnd_available > frame::MAX_STREAM_OVERHEAD
+            send_limit_from_cwnd > LEGACY_APP_LIMITED_BYTE_THRESHOLD
         {
             path.recovery.on_app_limited();
         }
@@ -5531,7 +5619,7 @@ impl<F: BufFactory> Connection<F> {
     ) -> Result<()> {
         let path = self.paths.get_mut(send_pid)?;
 
-        // It's fine to set the skip counter based on a non-active path's values.
+        // The skip counter may use values from an inactive path.
         let cwnd = path.recovery.cwnd();
         let max_datagram_size = path.recovery.max_datagram_size();
         self.pkt_num_spaces[epoch].on_packet_sent(&sent_pkt);
@@ -5800,11 +5888,9 @@ impl<F: BufFactory> Connection<F> {
             Ok(v) => v,
 
             Err(e) => {
-                // Collect the stream if it is now complete. This can happen if
-                // we got a `StreamReset` error which will now be propagated to
-                // the application, so we don't need to keep the stream's state
-                // anymore.
-                if stream.is_complete() {
+                // A StreamReset read completes the receive side, but an
+                // unreported STOP error still needs the send-side state.
+                if stream.state() == stream::StreamState::Collectable {
                     self.streams.collect(stream_id, local);
                 }
 
@@ -5817,7 +5903,7 @@ impl<F: BufFactory> Connection<F> {
 
         let readable = stream.is_readable();
 
-        let complete = stream.is_complete();
+        let state = stream.state();
 
         if stream.recv.almost_full() {
             self.streams.insert_almost_full(stream_id);
@@ -5827,7 +5913,7 @@ impl<F: BufFactory> Connection<F> {
             self.streams.remove_readable(&priority_key);
         }
 
-        if complete {
+        if state == stream::StreamState::Collectable {
             self.streams.collect(stream_id, local);
         }
 
@@ -6011,26 +6097,15 @@ impl<F: BufFactory> Connection<F> {
 
         let was_flushable = stream.is_flushable();
 
-        let is_complete = stream.is_complete();
-        let is_readable = stream.is_readable();
-
-        let priority_key = Arc::clone(&stream.priority_key);
-
-        // Return early if the stream has been stopped, and collect its state
-        // if complete.
-        if let Err(Error::StreamStopped(e)) = stream.send.cap() {
-            // Only collect the stream if it is complete and not readable.
-            // If it is readable, it will get collected when stream_recv()
-            // is used.
-            //
-            // The stream can't be writable if it has been stopped.
-            if is_complete && !is_readable {
-                let local = stream.local;
-                self.streams.collect(stream_id, local);
-            }
-
+        // Return the stop before collecting a completed stream.
+        if let Err(Error::StreamStopped(e)) =
+            stream.send.cap_and_report_stop_sending()
+        {
+            self.streams.on_stop_sending_reported(stream_id);
             return Err(Error::StreamStopped(e));
         };
+
+        let priority_key = Arc::clone(&stream.priority_key);
 
         // Truncate the input buffer based on the connection's send capacity if
         // necessary.
@@ -6245,6 +6320,11 @@ impl<F: BufFactory> Connection<F> {
                 let consumed = stream.recv.shutdown()?;
                 self.flow_control.add_consumed(consumed);
 
+                // Discarding unread data can complete the receive side, so no
+                // later read would collect the stream.
+                let state = stream.state();
+                let local = stream.local;
+
                 if !stream.recv.is_fin() {
                     self.streams.insert_stopped(stream_id, err);
                 }
@@ -6254,6 +6334,10 @@ impl<F: BufFactory> Connection<F> {
 
                 self.stopped_stream_local_count =
                     self.stopped_stream_local_count.saturating_add(1);
+
+                if state == stream::StreamState::Collectable {
+                    self.streams.collect(stream_id, local);
+                }
             },
 
             Shutdown::Write => {
@@ -6271,12 +6355,9 @@ impl<F: BufFactory> Connection<F> {
                 // inflight data.
                 self.streams.sub_tx_buffered(buffered_len);
 
-                // These drops in qlog are a bit weird, but the only way to ensure
-                // that all bytes that are moved from App to Transport in
-                // stream_do_send are eventually moved from Transport to Dropped.
-                // Ideally we would add a Transport to Network transition also as
-                // a way to indicate when bytes were transmitted vs dropped
-                // without ever being sent.
+                // Match App-to-Transport moves with Transport-to-Dropped moves.
+                // A Network transition would distinguish sent bytes from drops
+                // before transmission.
                 qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
                     let ev_data = EventData::QuicStreamDataMoved(
                         qlog::events::quic::StreamDataMoved {
@@ -6328,19 +6409,12 @@ impl<F: BufFactory> Connection<F> {
     /// [`StreamStopped`]: enum.Error.html#variant.StreamStopped
     #[inline]
     pub fn stream_capacity(&mut self, stream_id: u64) -> Result<usize> {
-        if let Some(stream) = self.streams.get(stream_id) {
-            let stream_cap = match stream.send.cap() {
+        if let Some(stream) = self.streams.get_mut(stream_id) {
+            let stream_cap = match stream.send.cap_and_report_stop_sending() {
                 Ok(v) => v,
 
                 Err(Error::StreamStopped(e)) => {
-                    // Only collect the stream if it is complete and not
-                    // readable. If it is readable, it will get collected when
-                    // stream_recv() is used.
-                    if stream.is_complete() && !stream.is_readable() {
-                        let local = stream.local;
-                        self.streams.collect(stream_id, local);
-                    }
-
+                    self.streams.on_stop_sending_reported(stream_id);
                     return Err(Error::StreamStopped(e));
                 },
 
@@ -6385,6 +6459,33 @@ impl<F: BufFactory> Connection<F> {
         stream.is_readable()
     }
 
+    /// Returns the number of contiguous bytes buffered for a stream, up to
+    /// `max_len`.
+    ///
+    /// This is the length of the contiguous, in-order data buffered at the
+    /// stream's current read offset, i.e. the bytes a call to [`stream_recv`]
+    /// would return right now. Data received out of order that sits behind a
+    /// gap is not counted, so this never reports bytes that are not yet
+    /// readable.
+    ///
+    /// This is a companion to [`stream_readable`], which only reports *whether*
+    /// data is available; this reports *how much*. It is intended for sizing a
+    /// receive buffer. The cost is proportional to the number of contiguous
+    /// buffered chunks at the front of the stream, up to `max_len`, and no data
+    /// is copied.
+    ///
+    /// Returns 0 if the stream does not exist.
+    ///
+    /// [`stream_recv`]: struct.Connection.html#method.stream_recv
+    /// [`stream_readable`]: struct.Connection.html#method.stream_readable
+    pub fn stream_readable_len(&self, stream_id: u64, max_len: usize) -> usize {
+        match self.streams.get(stream_id) {
+            Some(s) => s.recv.readable_len(max_len),
+
+            None => 0,
+        }
+    }
+
     /// Returns the next stream that can be written to.
     ///
     /// Note that once returned by this method, a stream ID will not be returned
@@ -6398,13 +6499,15 @@ impl<F: BufFactory> Connection<F> {
     /// The [`stream_writable()`] method can also be used to fine-tune when a
     /// stream is reported as writable again.
     ///
+    /// A stopped stream is returned even without send capacity. Querying its
+    /// capacity or writing to it returns [`StreamStopped`].
+    ///
     /// [`stream_writable()`]: struct.Connection.html#method.stream_writable
     /// [`writable()`]: struct.Connection.html#method.writable
+    /// [`StreamStopped`]: enum.Error.html#variant.StreamStopped
     pub fn stream_writable_next(&mut self) -> Option<u64> {
-        // If there is not enough connection-level send capacity, none of the
-        // streams are writable.
         if self.tx_cap == 0 {
-            return None;
+            return self.streams.pop_stopped_writable();
         }
 
         let mut cursor = self.streams.writable.front();
@@ -6614,6 +6717,9 @@ impl<F: BufFactory> Connection<F> {
     /// streams are only allowed to buffer outgoing data up to the amount that
     /// the peer allows to send.
     ///
+    /// Stopped streams are also included so that a write or capacity query can
+    /// return [`StreamStopped`], even without connection send capacity.
+    ///
     /// Note that the iterator will only include streams that were writable at
     /// the time the iterator itself was created (i.e. when `writable()` was
     /// called). To account for newly writable streams, the iterator needs to be
@@ -6639,12 +6745,12 @@ impl<F: BufFactory> Connection<F> {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     /// [`stream_priority()`]: struct.Connection.html#method.stream_priority
+    /// [`StreamStopped`]: enum.Error.html#variant.StreamStopped
     #[inline]
     pub fn writable(&self) -> StreamIter {
-        // If there is not enough connection-level send capacity, none of the
-        // streams are writable, so return an empty iterator.
+        // Stopped streams must be reported even without send capacity.
         if self.tx_cap == 0 {
-            return StreamIter::default();
+            return self.streams.stopped_writable();
         }
 
         self.streams.writable()
@@ -6672,8 +6778,8 @@ impl<F: BufFactory> Connection<F> {
 
         if let Some(max_datagram_size) = max_datagram_size {
             if self.is_established() {
-                // We cap the maximum packet size to 16KB or so, so that it can be
-                // always encoded with a 2-byte varint.
+                // Cap the packet size at 16,383 bytes so a two-byte varint can
+                // always encode it.
                 return cmp::min(16383, max_datagram_size);
             }
         }
@@ -7550,7 +7656,7 @@ impl<F: BufFactory> Connection<F> {
             });
         }
 
-        // When no packet was successfully processed close connection immediately.
+        // Close immediately if no packet was processed successfully.
         if self.recv_count == 0 {
             self.mark_closed();
         }
@@ -7673,13 +7779,32 @@ impl<F: BufFactory> Connection<F> {
     /// Revalidates the PMTU for the active path by sending a new probe packet
     /// of PMTU size. If the probe is dropped PMTUD will restart and find a new
     /// valid PMTU.
+    ///
+    /// If revalidation invalidates a previously discovered larger size, a
+    /// [`PathEvent::PmtuUpdated`] event is queued with QUIC's minimum packet
+    /// size. Further events report larger sizes as probes validate them.
     #[inline]
     pub fn revalidate_pmtu(&mut self) {
-        if let Ok(active_path) = self.paths.get_active_mut() {
-            if let Some(pmtud) = active_path.pmtud.as_mut() {
-                pmtud.revalidate_pmtu();
-            }
-        }
+        let Ok(active_path) = self.paths.get_active_mut() else {
+            return;
+        };
+
+        let local = active_path.local_addr();
+        let peer = active_path.peer_addr();
+        let Some(pmtud) = active_path.pmtud.as_mut() else {
+            return;
+        };
+
+        let old_pmtu = pmtud.get_current_mtu();
+        pmtud.revalidate_pmtu();
+
+        let Some(event) =
+            path::pmtu_event(local, peer, old_pmtu, pmtud.get_current_mtu())
+        else {
+            return;
+        };
+
+        self.paths.notify_event(event);
     }
 
     /// Returns true if the connection handshake is complete.
@@ -8011,74 +8136,71 @@ impl<F: BufFactory> Connection<F> {
             return self.handshake.process_post_handshake(&mut ex_data);
         }
 
-        match self.handshake.do_handshake(&mut ex_data) {
-            Ok(_) => (),
+        let handshake_needs_retry =
+            match self.handshake.do_handshake(&mut ex_data) {
+                Ok(_) => false,
+                Err(Error::Done) => true,
+                Err(e) => return Err(e),
+            };
 
-            Err(Error::Done) => {
-                // Apply in-handshake configuration from callbacks if the path's
-                // Recovery module can still be reinitilized.
-                if self
-                    .paths
-                    .get_active()
-                    .map(|p| p.can_reinit_recovery())
-                    .unwrap_or(false)
-                {
-                    if ex_data.recovery_config != self.recovery_config {
-                        if let Ok(path) = self.paths.get_active_mut() {
-                            self.recovery_config = ex_data.recovery_config;
-                            path.reinit_recovery(&self.recovery_config);
-                        }
-                    }
-
-                    if ex_data.tx_cap_factor != self.tx_cap_factor {
-                        self.tx_cap_factor = ex_data.tx_cap_factor;
-                    }
-
-                    if let Some((discover, max_probes)) = ex_data.pmtud {
-                        self.paths.set_discover_pmtu_on_existing_paths(
-                            discover,
-                            self.recovery_config.max_send_udp_payload_size,
-                            max_probes,
-                        );
-                    }
-
-                    if ex_data.local_transport_params !=
-                        self.local_transport_params
-                    {
-                        self.streams.set_max_streams_bidi(
-                            ex_data
-                                .local_transport_params
-                                .initial_max_streams_bidi,
-                        );
-
-                        self.local_transport_params =
-                            ex_data.local_transport_params;
-                    }
+        // BoringSSL reports success when entering early data before the
+        // handshake completes. Apply callback configuration after either
+        // non-fatal outcome so it is not lost on that path.
+        if self
+            .paths
+            .get_active()
+            .map(|p| p.can_reinit_recovery())
+            .unwrap_or(false)
+        {
+            if ex_data.recovery_config != self.recovery_config {
+                if let Ok(path) = self.paths.get_active_mut() {
+                    self.recovery_config = ex_data.recovery_config;
+                    path.reinit_recovery(&self.recovery_config);
                 }
+            }
 
-                // Try to parse transport parameters as soon as the first flight
-                // of handshake data is processed.
-                //
-                // This is potentially dangerous as the handshake hasn't been
-                // completed yet, though it's required to be able to send data
-                // in 0.5 RTT.
-                let raw_params = self.handshake.quic_transport_params();
+            if ex_data.tx_cap_factor != self.tx_cap_factor {
+                self.tx_cap_factor = ex_data.tx_cap_factor;
+            }
 
-                if !self.parsed_peer_transport_params && !raw_params.is_empty() {
-                    let peer_params = TransportParams::decode(
-                        raw_params,
-                        self.is_server,
-                        self.peer_transport_params_track_unknown,
-                    )?;
+            if let Some((discover, max_probes)) = ex_data.pmtud {
+                self.paths.set_discover_pmtu_on_existing_paths(
+                    discover,
+                    self.recovery_config.max_send_udp_payload_size,
+                    max_probes,
+                );
+            }
 
-                    self.parse_peer_transport_params(peer_params)?;
-                }
+            if ex_data.local_transport_params != self.local_transport_params {
+                self.streams.set_max_streams_bidi(
+                    ex_data.local_transport_params.initial_max_streams_bidi,
+                );
 
-                return Ok(());
-            },
+                self.local_transport_params = ex_data.local_transport_params;
+            }
+        }
 
-            Err(e) => return Err(e),
-        };
+        if handshake_needs_retry {
+            // Try to parse transport parameters as soon as the first flight of
+            // handshake data is processed.
+            //
+            // This is potentially dangerous as the handshake hasn't been
+            // completed yet, though it's required to be able to send data in
+            // 0.5 RTT.
+            let raw_params = self.handshake.quic_transport_params();
+
+            if !self.parsed_peer_transport_params && !raw_params.is_empty() {
+                let peer_params = TransportParams::decode(
+                    raw_params,
+                    self.is_server,
+                    self.peer_transport_params_track_unknown,
+                )?;
+
+                self.parse_peer_transport_params(peer_params)?;
+            }
+
+            return Ok(());
+        }
 
         self.handshake_completed = self.handshake.is_completed();
 
@@ -8156,6 +8278,17 @@ impl<F: BufFactory> Connection<F> {
             }
 
             return Ok(Type::from_epoch(epoch));
+        }
+
+        // APPLICATION_CLOSE can only be sent in a 1-RTT packet. Prioritize it
+        // over obsolete lower-epoch PTO probes, which cannot be consumed while
+        // closing because PING frames are suppressed.
+        if self.is_established() &&
+            self.local_error
+                .as_ref()
+                .is_some_and(|conn_err| conn_err.is_app)
+        {
+            return Ok(Type::Short);
         }
 
         for &epoch in packet::Epoch::epochs(
@@ -8246,6 +8379,21 @@ impl<F: BufFactory> Connection<F> {
         )
     }
 
+    /// Gets or creates a stream referenced by a received frame.
+    fn get_or_create_stream_for_received_frame(
+        &mut self, id: u64,
+    ) -> Result<&mut stream::Stream<F>> {
+        let local = stream::is_local(id, self.is_server);
+
+        // Opening a higher-numbered stream also opens lower streams of the
+        // same type, even if they do not have Stream objects yet.
+        if local && !self.streams.local_stream_opened(id) {
+            return Err(Error::InvalidStreamState(id));
+        }
+
+        self.get_or_create_stream(id, local)
+    }
+
     /// Processes an incoming frame.
     fn process_frame(
         &mut self, frame: frame::Frame, hdr: &Header, recv_path_id: usize,
@@ -8317,8 +8465,7 @@ impl<F: BufFactory> Connection<F> {
                     let largest_acked =
                         p.recovery.get_largest_acked_on_epoch(epoch);
 
-                    // Consider the skip_pn validated if the peer has sent an ack
-                    // for a larger pkt number.
+                    // A higher ACK validates `skip_pn`.
                     if let Some((largest_acked, skip_pn)) =
                         largest_acked.zip(skip_pn)
                     {
@@ -8358,7 +8505,9 @@ impl<F: BufFactory> Connection<F> {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
-                let stream = match self.get_or_create_stream(stream_id, false) {
+                let stream = match self
+                    .get_or_create_stream_for_received_frame(stream_id)
+                {
                     Ok(v) => v,
 
                     Err(Error::Done) => return Ok(()),
@@ -8378,6 +8527,11 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::FlowControl);
                 }
 
+                // The receive side can complete without the stream becoming
+                // readable, so no later read would collect it.
+                let state = stream.state();
+                let local = stream.local;
+
                 if !was_readable && stream.is_readable() {
                     self.streams.insert_readable(&priority_key);
                 }
@@ -8389,6 +8543,10 @@ impl<F: BufFactory> Connection<F> {
 
                 self.reset_stream_remote_count =
                     self.reset_stream_remote_count.saturating_add(1);
+
+                if state == stream::StreamState::Collectable {
+                    self.streams.collect(stream_id, local);
+                }
             },
 
             frame::Frame::StopSending {
@@ -8412,15 +8570,15 @@ impl<F: BufFactory> Connection<F> {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
-                let stream = match self.get_or_create_stream(stream_id, false) {
+                let stream = match self
+                    .get_or_create_stream_for_received_frame(stream_id)
+                {
                     Ok(v) => v,
 
                     Err(Error::Done) => return Ok(()),
 
                     Err(e) => return Err(e),
                 };
-
-                let was_writable = stream.is_writable();
 
                 let priority_key = Arc::clone(&stream.priority_key);
 
@@ -8442,12 +8600,10 @@ impl<F: BufFactory> Connection<F> {
                     // inflight data.
                     self.streams.sub_tx_buffered(buffered_len);
 
-                    // These drops in qlog are a bit weird, but the only way to
-                    // ensure that all bytes that are moved from App to Transport
-                    // in stream_do_send are eventually moved from Transport to
-                    // Dropped.  Ideally we would add a Transport to Network
-                    // transition also as a way to indicate when bytes were
-                    // transmitted vs dropped without ever being sent.
+                    // Match moves from App to Transport with moves from
+                    // Transport to Dropped.
+                    // A Network transition would distinguish sent bytes from
+                    // drops before transmission.
                     qlog_with_type!(QLOG_DATA_MV, self.qlog, q, {
                         let ev_data = EventData::QuicStreamDataMoved(
                             qlog::events::quic::StreamDataMoved {
@@ -8468,9 +8624,7 @@ impl<F: BufFactory> Connection<F> {
 
                     self.streams.insert_reset(stream_id, error_code, final_size);
 
-                    if !was_writable {
-                        self.streams.insert_writable(&priority_key);
-                    }
+                    self.streams.insert_stopped_writable(&priority_key);
 
                     self.stopped_stream_remote_count =
                         self.stopped_stream_remote_count.saturating_add(1);
@@ -8531,7 +8685,9 @@ impl<F: BufFactory> Connection<F> {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
-                let stream = match self.get_or_create_stream(stream_id, false) {
+                let stream = match self
+                    .get_or_create_stream_for_received_frame(stream_id)
+                {
                     Ok(v) => v,
 
                     Err(Error::Done) => return Ok(()),
@@ -8554,6 +8710,11 @@ impl<F: BufFactory> Connection<F> {
 
                 stream.recv.write(data)?;
 
+                // The receive side can complete without the stream becoming
+                // readable, so no later read would collect it.
+                let state = stream.state();
+                let local = stream.local;
+
                 if !was_readable && stream.is_readable() {
                     self.streams.insert_readable(&priority_key);
                 }
@@ -8566,6 +8727,10 @@ impl<F: BufFactory> Connection<F> {
                     // the received data as consumed, which might trigger a flow
                     // control update.
                     self.flow_control.add_consumed(max_off_delta);
+                }
+
+                if state == stream::StreamState::Collectable {
+                    self.streams.collect(stream_id, local);
                 }
             },
 
@@ -8593,7 +8758,9 @@ impl<F: BufFactory> Connection<F> {
                 // Note that it makes it impossible to check if the frame is
                 // illegal, since we have no state, but since we ignore the
                 // frame, it should be fine.
-                let stream = match self.get_or_create_stream(stream_id, false) {
+                let stream = match self
+                    .get_or_create_stream_for_received_frame(stream_id)
+                {
                     Ok(v) => v,
 
                     Err(Error::Done) => return Ok(()),
@@ -8609,8 +8776,8 @@ impl<F: BufFactory> Connection<F> {
 
                 let priority_key = Arc::clone(&stream.priority_key);
 
-                // If the stream is now flushable push it to the flushable queue,
-                // but only if it wasn't already queued.
+                // If the stream became flushable, add it to the queue unless it
+                // is already present.
                 if stream.is_flushable() && !was_flushable {
                     let priority_key = Arc::clone(&stream.priority_key);
                     self.streams.insert_flushable(&priority_key);
@@ -8909,18 +9076,18 @@ impl<F: BufFactory> Connection<F> {
         // Enter the app-limited phase of delivery rate when these conditions
         // are met:
         //
-        // - The remaining capacity is higher than available bytes in cwnd (there
+        // - The remaining capacity exceeds the available bytes in CWND (there
         //   is more room to send).
-        // - New data since the last send() is smaller than available bytes in
-        //   cwnd (we queued less than what we can send).
-        // - There is room to send more data in cwnd.
+        // - New data since the last `send()` is smaller than available bytes in
+        //   CWND (we queued less than what we can send).
+        // - CWND has room for more data.
         //
         // In application-limited phases the transmission rate is limited by the
         // application rather than the congestion control algorithm.
         //
-        // Note that this is equivalent to CheckIfApplicationLimited() from the
-        // delivery rate draft. This is also separate from `recovery.app_limited`
-        // and only applies to delivery rate calculation.
+        // This mirrors `CheckIfApplicationLimited()` from the delivery-rate
+        // draft but affects only delivery-rate calculation, not
+        // `recovery.app_limited`.
         let cwin_available = self
             .paths
             .iter()
@@ -9477,6 +9644,8 @@ pub use crate::path::SocketAddrIter;
 
 pub use crate::recovery::BbrBwLoReductionStrategy;
 pub use crate::recovery::BbrParams;
+#[cfg(feature = "internal")]
+pub use crate::recovery::BbrRttJumpDetector;
 pub use crate::recovery::CongestionControlAlgorithm;
 pub use crate::recovery::StartupExit;
 pub use crate::recovery::StartupExitReason;

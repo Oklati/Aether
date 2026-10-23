@@ -239,12 +239,13 @@ impl RecoveryEpoch {
 
         let mut largest_lost_pkt = None;
 
-        let unacked_iter = self.sent_packets
-        .iter_mut()
-        // Skip packets that follow the largest acked packet.
-        .take_while(|p| p.pkt_num <= largest_acked)
-        // Skip packets that have already been acked or lost.
-        .filter(|p| p.time_acked.is_none() && p.time_lost.is_none());
+        let unacked_iter = self
+            .sent_packets
+            .iter_mut()
+            // Skip packets that follow the largest acked packet.
+            .take_while(|p| p.pkt_num <= largest_acked)
+            // Skip packets that have already been acked or lost.
+            .filter(|p| p.time_acked.is_none() && p.time_lost.is_none());
 
         for unacked in unacked_iter {
             // Mark packet as lost, or set time when it should be marked.
@@ -809,12 +810,15 @@ impl RecoveryOps for LegacyRecovery {
             usize::MAX
         };
 
-        let unacked_iter = epoch.sent_packets
+        let unacked_iter = epoch
+            .sent_packets
             .iter()
             .take(sent_packets_iter_limit)
             // Skip packets that have already been acked or lost, and packets
             // that don't contain either CRYPTO or STREAM frames.
-            .filter(|p| p.has_data && p.time_acked.is_none() && p.time_lost.is_none())
+            .filter(|p| {
+                p.has_data && p.time_acked.is_none() && p.time_lost.is_none()
+            })
             // Only return as many packets as the number of probe packets that
             // will be sent.
             .take(epoch.loss_probes);
@@ -883,11 +887,6 @@ impl RecoveryOps for LegacyRecovery {
     }
 
     fn cwnd_available(&self) -> usize {
-        // Ignore cwnd when sending probe packets.
-        if self.epochs.iter().any(|e| e.loss_probes > 0) {
-            return usize::MAX;
-        }
-
         // Open more space (snd_cnt) for PRR when allowed.
         self.cwnd().saturating_sub(self.bytes_in_flight.get()) +
             self.congestion.prr.snd_cnt
@@ -923,6 +922,16 @@ impl RecoveryOps for LegacyRecovery {
         None
     }
 
+    fn rtt_persistent_jump_count(&self) -> u64 {
+        // Persistent RTT jump counts are produced by the BBR2 RTT jump
+        // detector. Legacy Reno/CUBIC recovery does not own a BBR2 network
+        // model or run that detector, but it still implements
+        // RecoveryOps so PathStats can be populated through one shared
+        // interface. Report zero to indicate that no detector is active on
+        // this path.
+        0
+    }
+
     /// Statistics from when a CCA first exited the startup phase.
     fn startup_exit(&self) -> Option<StartupExit> {
         self.congestion.ssthresh.startup_exit()
@@ -944,6 +953,7 @@ impl RecoveryOps for LegacyRecovery {
         }
 
         self.max_datagram_size = new_max_datagram_size;
+        (self.congestion.cc_ops.on_mtu_update)(&mut self.congestion);
     }
 
     fn update_max_datagram_size(&mut self, new_max_datagram_size: usize) {
@@ -1013,7 +1023,7 @@ impl RecoveryOps for LegacyRecovery {
         self.epochs[epoch].test_largest_sent_pkt_num_on_path
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "qlog"))]
     fn app_limited(&self) -> bool {
         self.congestion.app_limited
     }
@@ -1050,6 +1060,7 @@ impl RecoveryOps for LegacyRecovery {
             lost_packets: Some(self.congestion.lost_count as u64),
             lost_bytes: Some(self.bytes_lost),
             pto_count: Some(self.pto_count),
+            app_limited: Some(self.app_limited()),
             ..Default::default()
         };
 
