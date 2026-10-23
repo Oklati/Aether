@@ -388,7 +388,7 @@ jobs:
   # ------------------------------------------------------------------
   release:
     name: Publish release
-    needs: [desktop, linux, linux-armv7, linux-armv7-musl, linux-musl, android]
+    needs: [desktop, linux, linux-musl, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
